@@ -114,19 +114,26 @@ return function(api)
 
     moves.montage = montage
 
-    coop.handlers.U = function(rest)
+    -- One move of one peer's ghost. rest is the event's arguments; from is the peer it came from (nil: the only
+    -- one), and id is set for a copy the host forwarded for another guest.
+    local function play(rest, from, id)
         local path, pos = (rest or ""):match("^(%S+)%s+(%S+)$")
         pos = tonumber(pos)
         if not (allowedPath(path) and pos and pos == pos and pos >= 0 and pos < 600) then
             moves.refused = moves.refused + 1
             return
         end
+        local ghost = api.coop.ghostOf(from)
+        if id ~= nil then
+            local p = net.peers["@" .. id]
+            ghost = valid(p and p.ghost) and p.ghost or nil
+        end
         moves.partnerSends = true
-        if net.pvp or not valid(net.ghost) or net.ghostHidden then
+        if net.pvp or not valid(ghost) or (from == nil and net.ghostHidden) then
             return
         end
         local m = montage(path)
-        local ai = animOf(net.ghost)
+        local ai = animOf(ghost)
         if not (m and ai) then
             moves.failed = moves.failed + 1
             return
@@ -143,14 +150,27 @@ return function(api)
         end
     end
 
+    coop.handlers.U = function(rest, from)
+        play(rest, from, nil)
+    end
+
+    -- A guest's move, forwarded by the host: "<their id> <path> <position>".
+    coop.handlers.u = function(rest)
+        local id, args = (rest or ""):match("^(%S+)%s*(.*)$")
+        if id and id ~= net.selfId then
+            play(args, nil, id)
+        end
+    end
+
     -- Ability replays only until the partner sends montages (and always in PvP).
     local replayAbility = coop.handlers.M
     if replayAbility then
-        coop.handlers.M = function(rest)
-            if moves.partnerSends and not net.pvp then
+        coop.handlers.M = function(rest, from)
+            local ghost = api.coop.ghostOf(from)
+            if moves.partnerSends and not net.pvp and valid(ghost) then
                 return
             end
-            return replayAbility(rest)
+            return replayAbility(rest, from)
         end
     end
 

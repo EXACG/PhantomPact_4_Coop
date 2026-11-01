@@ -108,12 +108,19 @@ return function(api)
         end
         local last = status.last
         net.rttMs = tonumber(s.rtt_ms)
+        net.peersConnected = tonumber(s.peers) or ((s.connected == "yes") and 1 or 0)
 
+        local party = tonumber(s.peers)
         if s.connected == "yes" and last.connected ~= "yes" then
             notify("conn", "partner connected" .. (net.rttMs and string.format(" (ping %d ms)", net.rttMs) or "")
-                .. (s.auth == "on" and ", signed" or "") .. ".")
+                .. (s.auth == "on" and ", signed" or "")
+                .. (party and party > 1 and string.format(" - %d players", party + 1) or "") .. ".")
         elseif s.connected == "no" and last.connected == "yes" then
             notify("conn", "partner disconnected.")
+        elseif party and tonumber(last.peers) and party > tonumber(last.peers) then
+            notify("conn", string.format("%d players now.", party + 1))
+        elseif party and tonumber(last.peers) and party < tonumber(last.peers) then
+            notify("conn", string.format("%d players now.", party + 1))
         end
 
         if s.mismatch and s.mismatch ~= "-" and s.mismatch ~= last.mismatch then
@@ -170,7 +177,9 @@ return function(api)
         else
             local s = readStatus() or {}
             log("Relay: connected=" .. tostring(s.connected) .. " rtt_ms=" .. tostring(s.rtt_ms) .. " auth="
-                .. tostring(s.auth) .. " mismatch=" .. tostring(s.mismatch) .. " rejected=" .. tostring(s.rejected))
+                .. tostring(s.auth) .. " mismatch=" .. tostring(s.mismatch) .. " rejected=" .. tostring(s.rejected)
+                .. " players=" .. tostring((tonumber(s.peers) or ((s.connected == "yes") and 1 or 0)) + 1)
+                .. " max=" .. tostring(s.max_players))
         end
     end
 

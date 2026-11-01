@@ -27,6 +27,7 @@ return function(api)
 
     local hud = { on = true }
     local lineWidget, dotWidget
+    local dots = {}                 -- peer key -> its dot (one partner each, stage 5 of docs/MULTIPLAYER.md)
     local textures = {}
 
     local function texture(name)
@@ -95,24 +96,35 @@ return function(api)
     end
 
     local function remove()
-        for _, w in ipairs({ lineWidget, dotWidget }) do
+        local all = { lineWidget, dotWidget }
+        for _, w in pairs(dots) do
+            all[#all + 1] = w
+        end
+        for _, w in ipairs(all) do
             if valid(w) then
                 pcall(function() w:RemoveFromParent() end)
             end
         end
         lineWidget, dotWidget = nil, nil
+        dots = {}
     end
 
     local function onScreen(w)
         return api.status and api.status.onScreen and api.status.onScreen(w)
     end
 
-    local function fresh()
-        return net.enabled and not net.partnerGone and net.target ~= nil and net.lastRemoteAt ~= nil
-            and os.clock() - net.lastRemoteAt <= FRESH_S
+    local function freshOf(p)
+        return net.enabled and not p.gone and p.target ~= nil and p.lastRemoteAt ~= nil
+            and os.clock() - p.lastRemoteAt <= FRESH_S
     end
 
-    -- Degrees from where the camera faces to the partner, -180..180 (negative = to the left).
+    -- A peer we draw a dot for: its position is fresh and it's on this map.
+    local function onThisMap(p)
+        local t = p.target
+        return freshOf(p) and not (t.Map and net.localMap and t.Map ~= "?" and t.Map ~= net.localMap)
+    end
+
+    -- Degrees from where the camera faces to a point, -180..180 (negative = to the left).
     local function bearing(pc, from, to)
         local camYaw = pc.PlayerCameraManager:GetCameraRotation().Yaw
         local angle = math.deg(math.atan(to.Y - from.Y, to.X - from.X))
@@ -120,22 +132,40 @@ return function(api)
     end
 
     local function update()
-        local t = net.target
-        local otherMap = t and t.Map and net.localMap and t.Map ~= "?" and t.Map ~= net.localMap
-        if not (hud.on and fresh()) or otherMap then
+        if not hud.on then
             show(lineWidget, false)
-            show(dotWidget, false)
+            for _, w in pairs(dots) do
+                show(w, false)
+            end
             return
         end
         local pc, pawn = api.getPlayer1()
         if not (valid(pc) and valid(pawn)) then
             return
         end
+        -- Every partner (one dot each), nearest first so a crowded compass stays readable.
+        local here = pawn:K2_GetActorLocation()
+        local shown = {}
+        for _, p in ipairs(api.coop.peerList()) do
+            if onThisMap(p) then
+                shown[#shown + 1] = p
+            end
+        end
+        table.sort(shown, function(a, b)
+            local ta, tb = a.target, b.target
+            local da = (ta.X - here.X) ^ 2 + (ta.Y - here.Y) ^ 2
+            local db = (tb.X - here.X) ^ 2 + (tb.Y - here.Y) ^ 2
+            return da < db
+        end)
+        if #shown == 0 then
+            show(lineWidget, false)
+            for _, w in pairs(dots) do
+                show(w, false)
+            end
+            return
+        end
         if not onScreen(lineWidget) then
             lineWidget = nil
-        end
-        if not onScreen(dotWidget) then
-            dotWidget = nil
         end
         local size = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary"):GetViewportSize(pc)
         local scale = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary"):GetViewportScale(pc)
@@ -147,26 +177,55 @@ return function(api)
         local width = vw * LINE_WIDTH_FRAC
         local cx, cy = vw / 2, vh * LINE_Y_FRAC
         lineWidget = lineWidget or newImage("compass_line.png", width, width * LINE_ASPECT)
-        dotWidget = dotWidget or newImage("partner_dot.png", DOT_SIZE, DOT_SIZE)
-        if not (lineWidget and dotWidget) then
+        if not lineWidget then
             return
         end
-        local from = pawn:K2_GetActorLocation()
-        local to = (valid(net.ghost) and not net.ghostHidden) and net.ghost:K2_GetActorLocation() or t
-        local deg = bearing(pc, from, to)
-        local behind = math.abs(deg) > COMPASS_HALF_DEG
-        local x = cx + math.max(-1, math.min(1, deg / COMPASS_HALF_DEG)) * width / 2
         lineWidget:SetPositionInViewport({ X = cx, Y = cy }, false)
-        dotWidget:SetPositionInViewport({ X = x, Y = cy }, false)
         fit(lineWidget, width, width * LINE_ASPECT)
-        fit(dotWidget, DOT_SIZE, DOT_SIZE)
-        local down = net.partnerDowned or (t.MaxHp and t.MaxHp > 0 and t.Hp and t.Hp <= 0)
-        pcall(function()
-            dotWidget.Circle:SetColorAndOpacity(down and DOWN_TINT or NORMAL_TINT)
-            dotWidget:SetRenderOpacity(behind and 0.55 or 1.0)
-        end)
         show(lineWidget, true)
-        show(dotWidget, true)
+        for _, p in ipairs(shown) do
+            local w = dots[p.key]
+            if not onScreen(w) then
+                w = newImage("partner_dot.png", DOT_SIZE, DOT_SIZE)
+                dots[p.key] = w
+            end
+            if valid(w) then
+                local t = p.target
+                local to = (valid(p.ghost) and not p.ghostHidden) and p.ghost:K2_GetActorLocation() or t
+                local deg = bearing(pc, here, to)
+                local behind = math.abs(deg) > COMPASS_HALF_DEG
+                local x = cx + math.max(-1, math.min(1, deg / COMPASS_HALF_DEG)) * width / 2
+                -- A peer a little further is nudged off the same spot, so two dots never hide each other.
+                local extra = 0
+                for _, other in pairs(dots) do
+                    if other ~= w then
+                        local ok, ox = pcall(function() return other:GetPositionInViewport() end)
+                        if ok and ox and math.abs(ox.X - x) < DOT_SIZE * 0.7 then
+                            extra = extra + DOT_SIZE * 0.9
+                        end
+                    end
+                end
+                w:SetPositionInViewport({ X = x, Y = cy + extra }, false)
+                fit(w, DOT_SIZE, DOT_SIZE)
+                local down = p.downed or (t.MaxHp and t.MaxHp > 0 and t.Hp and t.Hp <= 0)
+                pcall(function()
+                    w.Circle:SetColorAndOpacity(down and DOWN_TINT or NORMAL_TINT)
+                    w:SetRenderOpacity(behind and 0.55 or 1.0)
+                end)
+                show(w, true)
+            end
+        end
+        for key, w in pairs(dots) do
+            local keep = false
+            for _, p in ipairs(shown) do
+                if p.key == key then
+                    keep = true
+                end
+            end
+            if not keep then
+                show(w, false)
+            end
+        end
     end
 
     coop.extraTicks.hud = function()

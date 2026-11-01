@@ -21,14 +21,20 @@ return function(api)
 
     local mapicon = { on = true }
     local ticks = 0
-    local icon, owner, openMap, scaleX, scaleY
-    local hidden = true
+    local icons, openMap, scaleX, scaleY
+    icons = {}                      -- peer key -> its pointer (one per partner, stage 5 of docs/MULTIPLAYER.md)
 
-    local function hide()
-        if not hidden and valid(icon) then
+    local function hideOne(key)
+        local icon = icons[key]
+        if valid(icon) then
             pcall(function() icon:SetVisibility(1) end)    -- collapsed
         end
-        hidden = true
+    end
+
+    local function hide()
+        for key in pairs(icons) do
+            hideOne(key)
+        end
     end
 
     local function findMap()
@@ -39,13 +45,64 @@ return function(api)
         end
     end
 
+    -- One partner's pointer: make it if needed, then put it where they are.
+    local function draw(t, mine, ms, mapId, project)
+        local px, py = project(t.X, t.Y, t.Z)
+        if not (px and scaleX) then
+            return false
+        end
+        return px, py
+    end
+
+    local function iconFor(key, mine)
+        local icon = icons[key]
+        if valid(icon) then
+            return icon
+        end
+        local pc = FindFirstOf("PlayerController")
+        if not valid(pc) then
+            return nil
+        end
+        icon = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary"):Create(pc, mine:GetClass(), pc)
+        if not valid(icon) then
+            return nil
+        end
+        local slot = mine:GetParent():AddChildToCanvas(icon)
+        slot:SetAutoSize(mine.Slot:GetAutoSize())
+        slot:SetSize(mine.Slot:GetSize())
+        slot:SetAlignment(mine.Slot:GetAlignment())
+        icons[key] = icon
+        return icon
+    end
+
     local function update()
-        local t = net.target
         local ms = FindFirstOf("MapSubsystem")
-        local fresh = t and net.lastRemoteAt and not net.partnerGone and os.clock() - net.lastRemoteAt <= FRESH_S
         local mine = openMap.WB_PlayerIcon
-        if not (fresh and valid(ms) and valid(mine) and t.Map == net.localMap) then
+        if not (valid(ms) and valid(mine)) then
             hide()
+            return
+        end
+        -- Every partner whose position is fresh and who is on this map; the others' pointers go.
+        local shown = {}
+        for _, p in ipairs(api.coop.peerList()) do
+            local t = p.target
+            local fresh = t and p.lastRemoteAt and not p.gone and os.clock() - p.lastRemoteAt <= FRESH_S
+            if fresh and t.Map == net.localMap then
+                shown[#shown + 1] = p
+            end
+        end
+        for key in pairs(icons) do
+            local keep = false
+            for _, p in ipairs(shown) do
+                if p.key == key then
+                    keep = true
+                end
+            end
+            if not keep then
+                hideOne(key)
+            end
+        end
+        if #shown == 0 then
             return
         end
         local mapId = ms:GetCurrentMapID()
@@ -66,38 +123,25 @@ return function(api)
                 scaleX, scaleY = pos.X / ux, pos.Y / uy
             end
         end
-        local px, py = project(t.X, t.Y, t.Z)
-        if not (px and scaleX) then
-            hide()
-            return
-        end
-        if not (valid(icon) and owner == openMap:GetAddress()) then
-            if valid(icon) then
-                pcall(function() icon:RemoveFromParent() end)
+        for _, p in ipairs(shown) do
+            local t = p.target
+            local px, py = draw(t, mine, ms, mapId, project)
+            if px then
+                local icon = iconFor(p.key, mine)
+                if valid(icon) then
+                    icon.Slot:SetPosition({ X = px * scaleX, Y = py * scaleY })
+                    local yaw = math.rad(t.Yaw or 0)
+                    local fx, fy = project(t.X + math.cos(yaw) * AHEAD_CM, t.Y + math.sin(yaw) * AHEAD_CM, t.Z)
+                    if fx and (fx ~= px or fy ~= py) then
+                        icon:SetRenderTransformAngle(math.deg(math.atan(fx - px, py - fy)))
+                    end
+                    local down = p.downed or (t.MaxHp and t.MaxHp > 0 and t.Hp and t.Hp <= 0)
+                    icon:SetColorAndOpacity(down and DOWN_TINT or JADE)
+                    pcall(function() icon:SetVisibility(3) end)   -- hit-test invisible
+                end
+            else
+                hideOne(p.key)
             end
-            local pc = FindFirstOf("PlayerController")
-            if not valid(pc) then
-                return
-            end
-            icon = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary"):Create(pc, mine:GetClass(), pc)
-            local slot = mine:GetParent():AddChildToCanvas(icon)
-            slot:SetAutoSize(mine.Slot:GetAutoSize())
-            slot:SetSize(mine.Slot:GetSize())
-            slot:SetAlignment(mine.Slot:GetAlignment())
-            owner = openMap:GetAddress()
-            hidden = true
-        end
-        icon.Slot:SetPosition({ X = px * scaleX, Y = py * scaleY })
-        local yaw = math.rad(t.Yaw or 0)
-        local fx, fy = project(t.X + math.cos(yaw) * AHEAD_CM, t.Y + math.sin(yaw) * AHEAD_CM, t.Z)
-        if fx and (fx ~= px or fy ~= py) then
-            icon:SetRenderTransformAngle(math.deg(math.atan(fx - px, py - fy)))
-        end
-        local down = net.partnerDowned or (t.MaxHp and t.MaxHp > 0 and t.Hp and t.Hp <= 0)
-        icon:SetColorAndOpacity(down and DOWN_TINT or JADE)
-        if hidden then
-            pcall(function() icon:SetVisibility(3) end)
-            hidden = false
         end
     end
 
@@ -115,7 +159,7 @@ return function(api)
             if not isOpen then
                 openMap = findMap()
                 if not openMap then
-                    hidden = true   -- the icon closed with the map
+                    icons = {}      -- the pointers went with the map; new ones on the next open
                     return
                 end
             end

@@ -2,10 +2,16 @@
 
 The game mod and this relay talk through small text files in the mod folder:
   net_out.txt         written by the mod: the local snapshot, several lines (player "P ...", enemies "E ...")
-  net_in.txt          written by the relay: the remote side's latest snapshot
+  net_in.txt          written by the relay: the other side's latest snapshot (one peer)
+  net_in_<peer>.txt   the same, one file per peer once a host has more than one guest (the mod reads both)
   net_events_out.txt  written by the mod: "S <session>" then one numbered event per line ("<id> <type> <args>")
-  net_events_in.txt   written by the relay: the remote side's events, in order, same format
-  net_status.txt      written by the relay: connection state, peer address, round-trip time
+  net_events_in.txt   written by the relay: the other side's events, in order, same format (net_events_in_<peer>.txt
+                      per peer with more than one)
+  net_status.txt      written by the relay: connection state, peer address, round-trip time, and "peers=<n>" with
+                      one peer<n>=<address>,<up|gone>,<rtt> per peer when there is more than one
+
+A host serves up to --max-players (2 by default: one host, one guest, exactly as before), star topology: guests
+talk to the host and to nobody else, and the host passes on what the others need.
 
 Snapshots are newest-wins: a lost packet is simply replaced by the next one 50 ms later.
 Events (attacks, kills, pickups) are reliable: resent every tick until the peer acknowledges them.
@@ -34,6 +40,7 @@ import re
 import struct
 import select
 import socket
+import sys
 import time
 
 PORT = 47800
@@ -41,7 +48,7 @@ TICK = 0.05          # 20 sends per second
 WATCH = 0.005        # how often the mod's files are checked for something new to send at once
 PING_EVERY = 1.0
 PEER_TIMEOUT = 3.0
-PROTOCOL = 2
+PROTOCOL = 3
 MAX_EVENTS_PER_PACKET = 40
 MAX_EVENT_BYTES = 1000  # and this much text, so a packet stays under a VPN's 1280-byte limit and isn't split
 MAX_SNAPSHOT_BYTES = 48000
@@ -141,6 +148,7 @@ PARTNER_NETWORKS = [ipaddress.ip_network(n) for n in (
     "100.64.0.0/10", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8",
     "25.0.0.0/8", "26.0.0.0/8")]
 MAX_PACKETS_PER_RECEIVE = 256   # a flood can't keep the relay reading forever (ticks and status would stall)
+PRUNE_AFTER = 12.0      # s: a peer that has been silent this long loses its slot (and its snapshot file)
 
 
 def address_allowed(ip, allow):
@@ -230,6 +238,124 @@ def clean_token(value, limit=32):
     return re.sub(r"[^\w.\-]", "", str(value))[:limit] or "?"
 
 
+class Peer:
+    """One other relay, as this one knows it: a host keeps one per guest, a guest one per network (its host)."""
+
+    def __init__(self, addr, now, key):
+        self.addr = addr
+        self.key = key             # the suffix of its files: the address it first came from
+        self.last_heard = now
+        self.last_hello = 0.0
+        self.rtt_ms = None
+        self.partner_version = None
+        self.mismatch = []
+        self.acked = {}            # our session -> highest event id this peer confirmed
+        self.events_acked = 0
+        self.in_blanked = False    # its snapshot file emptied because it went silent
+        self.in_player = ""        # its latest position lines, and below its enemy lines
+        self.in_enemies = ""
+        self.last_enemies = 0.0
+        self.enemies_sent = False  # the last enemy packet had enemies: an empty list must follow them
+
+    def alive(self, now):
+        return now - self.last_heard <= PEER_TIMEOUT
+
+
+class Stage:
+    """Who this relay talks to: stage 1 of docs/MULTIPLAYER.md, the relay learns about peers.
+
+    A host accepts every sender that passes the filter, up to max_players: the first one to talk fills the second
+    slot, so a host with one guest behaves exactly like 1.4.1. A guest keeps one peer per network (its host) and
+    never answers another guest's ping. Peers are told apart by address, or by the link's own identity (a Steam
+    name) where it has one, which survives an address change. Only the mod-side file names depend on how many
+    peers there are, and that's Relay's business.
+    """
+
+    def __init__(self, role, folder, link, max_players=2):
+        self.role = role
+        self.folder = folder
+        self.link = link
+        # MaxPlayers counts players, the host included: a host with 2 takes one guest, with 4 three of them.
+        self.max_players = max(1, int(max_players))
+        self.peers = {}             # key -> Peer, in the order they were first heard from
+        self.refused = 0            # senders turned away over the player limit (net_status.txt shows it)
+        self.rejected = 0           # packets refused by the secret check (forged, replayed, no or other secret)
+        if link.peer is not None:
+            # A UDP guest is given its host up front; a Steam guest may still be looking for one.
+            self.peer_for(link.peer, time.monotonic())
+
+    def targets(self):
+        return list(self.peers.values())
+
+    def one(self, addr, via=None):
+        by_ident = self.peers.get(via) if via is not None else None
+        return by_ident or next((p for p in self.peers.values() if p.addr == addr), None)
+
+    def peer_for(self, addr, now, via=None):
+        """The peer at that address; a host takes it on (up to the limit) the first time it hears from it."""
+        peer = self.one(addr, via)
+        if peer is not None:
+            peer.addr = addr
+            peer.last_heard = now
+            return peer
+        if self.role != "host" and self.peers:
+            return None             # a guest talks to one host per network and to nobody else
+        ident = via if via is not None else key_name(self.link, addr)
+        peer = self.peers.get(ident)                  # the same peer back at another address keeps its files
+        if peer is None:
+            peer = Peer(addr, now, peer_key(ident))
+        peer.addr = addr
+        peer.last_heard = now
+        self.peers[peer.key] = peer
+        return peer
+
+    def prune(self, now):
+        """A sender over the limit that has been silent for a while loses its slot, and its snapshot goes."""
+        if self.role != "host":
+            return
+        for key, peer in list(self.peers.items()):
+            if now - peer.last_heard > PRUNE_AFTER:
+                del self.peers[key]
+                remove_quietly(self.snapshot_path(peer))
+
+    # --- the peer's files, as the mod reads them ---------------------------
+
+    def snapshot_path(self, peer):
+        return os.path.join(self.folder, f"net_in_{peer.key}.txt")
+
+    def events_path(self, peer):
+        return os.path.join(self.folder, f"net_events_in_{peer.key}.txt")
+
+    def keep_snapshots(self):
+        """Delete the snapshot files of peers that are gone (and only those: the others are being written)."""
+        try:
+            names = os.listdir(self.folder)
+        except OSError:
+            return
+        keep = {os.path.basename(self.snapshot_path(p)) for p in self.peers.values() if not p.in_blanked}
+        for name in names:
+            if name.startswith("net_in_") and name.endswith(".txt") and name != "net_in.txt" and name not in keep:
+                remove_quietly(os.path.join(self.folder, name))
+
+
+def key_name(link, addr):
+    """A peer's short name: what its files are called and what net_status.txt lists it as."""
+    naming = getattr(link, "key_name", None)
+    return naming(addr) if naming else link.describe(addr)
+
+
+def peer_key(name):
+    """A peer's file suffix: its address (or Steam name), cleaned so it is safe as a file name."""
+    return clean_token(name, 40)
+
+
+def remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 class UdpLink:
     """Plain UDP (Tailscale or LAN IPs). Peers are (ip, port) tuples."""
 
@@ -272,6 +398,11 @@ class UdpLink:
 
     def describe(self, addr):
         return f"{addr[0]}:{addr[1]}"
+
+    # A peer's name in net_status.txt and in its file names. A host has several guests, and their addresses share
+    # a "127.0.0.1:" prefix: leave it out so the names stay tellable apart (and short enough to be file names).
+    def key_name(self, addr):
+        return f"{addr[0]}-{addr[1]}"
 
     def describe_self(self):
         return f"UDP {self.sock.getsockname()[1]}"
@@ -317,6 +448,10 @@ class SteamLink:
         time.sleep(min(seconds, 0.005))
         return True
 
+    def key_name(self, addr):
+        # The SteamID64 is the name; its last digits keep two friends apart in a file name.
+        return str(addr)[-8:]
+
     def candidates(self):
         now = time.monotonic()
         if now - self._friends_at >= self.FRIENDS_REFRESH:
@@ -342,112 +477,243 @@ def split_snapshot(text):
 
 class Relay:
     def __init__(self, role, folder, peer, port, link=None, allow="partner", secret=None, settings=None,
-                 version="?"):
+                 version="?", max_players=2):
         self.role = role
+        self.folder = folder
         self.out_path = os.path.join(folder, "net_out.txt")
         self.in_path = os.path.join(folder, "net_in.txt")
         self.events_out_path = os.path.join(folder, "net_events_out.txt")
         self.status_path = os.path.join(folder, "net_status.txt")
-        self.inbox = EventInbox(os.path.join(folder, "net_events_in.txt"))
         self.link = link or UdpLink(role, peer, port, allow)
         self.auth = Auth(secret, role) if secret else None
-        self.rejected = 0                 # packets refused by the secret check (forged, replayed, or no/other secret)
+        self.stage = Stage(role, folder, self.link, max_players)
+        # 1.4.1's files while one peer is connected (net_in.txt, net_events_in.txt: a mod that knows nothing about
+        # parties reads them); from the second peer on, one pair per peer.
+        self.single = len(self.stage.peers) <= 1
+        self.inboxes = {p.key: EventInbox(self.events_path(p)) for p in self.stage.targets()}
         self.settings = {k: str(v).lower() for k, v in (settings or {}).items() if k in SHARED_SETTINGS}
         self.version = clean_token(version)
-        self.partner_version = None
-        self.mismatch = []
-        self.last_hello = 0.0
         self.out_signature = None         # (mtime, size) of the mod's files when last sent
-        self.peer = self.link.peer        # host: learned from the first packet; Steam guest: maybe found later
-        self.last_heard = 0.0
-        self.rtt_ms = None
         self.last_ping = 0.0
         self.received = 0
         self.sent = 0
-        self.acked = {}                   # our session -> highest event id the peer confirmed
-        self.events_acked = 0
-        self.in_blanked = False           # net_in.txt emptied because the peer went silent
-        self.in_player = ""               # the peer's latest position lines, and below its enemy lines
-        self.in_enemies = ""
         self.last_state = 0.0
-        self.last_enemies = 0.0
         self.last_session = 0.0
-        self.enemies_sent = False         # the last enemy packet had enemies: an empty list must follow them
+        self._fresh = False               # set by _join_seen: this packet came from a peer just taken on
+
+    # --- peers ------------------------------------------------------------
+
+    @property
+    def peers(self):
+        return self.stage.peers
+
+    @property
+    def peer(self):
+        """The first peer (None before one connects): how a one-to-one session is read."""
+        return next(iter(self.peers.values()), None)
+
+    @property
+    def inbox(self):
+        first = self.peer
+        return self.inboxes[first.key] if first else EventInbox(os.path.join(self.folder, "net_events_in.txt"))
+
+    @property
+    def rejected(self):
+        return self.stage.rejected
+
+    @property
+    def max_players(self):
+        return self.stage.max_players
+
+    # What used to be one peer's fields, read off the first peer: a one-to-one session reads the same as before.
+    @property
+    def rtt_ms(self):
+        return self.peer.rtt_ms if self.peer else None
+
+    @property
+    def mismatch(self):
+        return self.peer.mismatch if self.peer else []
+
+    @property
+    def partner_version(self):
+        return self.peer.partner_version if self.peer else None
+
+    @property
+    def last_heard(self):
+        return self.peer.last_heard if self.peer else 0.0
+
+    def snapshot_path(self, peer):
+        return self.in_path if self.single else self.stage.snapshot_path(peer)
+
+    def events_path(self, peer):
+        return (os.path.join(self.folder, "net_events_in.txt") if self.single
+                else self.stage.events_path(peer))
+
+    def _join(self, addr, now):
+        via = getattr(self.link, "session", None)
+        peer = self.stage.one(addr, via) or self.stage.peer_for(addr, now, via)
+        if peer is not None and peer.key not in self.inboxes:
+            self.inboxes[peer.key] = EventInbox(self.events_path(peer))
+        return peer
+
+    # --- sending ----------------------------------------------------------
 
     def send(self, msg, to=None):
-        to = to if to is not None else self.peer
-        if to is None:
-            return
+        """To one peer (a Peer, an address, or None for every peer)."""
         msg["v"] = PROTOCOL
         data = json.dumps(msg, separators=(",", ":")).encode()
         if self.auth:
             data = self.auth.seal(data)
-        try:
-            self.link.send(to, data)
-            self.sent += 1
-        except OSError:
-            pass
+        for target in self._resolve(to):
+            try:
+                self.link.send(target.addr, data)
+                self.sent += 1
+            except OSError:
+                pass
+
+    def _resolve(self, to):
+        if to is None:
+            return self.stage.targets()
+        if isinstance(to, Peer):
+            return [to]
+        peer = self.stage.one(to, getattr(self.link, "session", None))
+        if peer is not None:
+            return [peer]
+        # A guest still looking for its host has no peer yet: its candidates are sent to by address.
+        return [Peer(to, 0.0, peer_key(self.link.describe(to)))]
+
+    def _who(self, peer):
+        return self.link.describe(peer.addr)
+
+    def _name(self, peer):
+        """The peer's short name: the file suffix, and what net_status.txt lists."""
+        return peer.key
+
+    # --- receiving --------------------------------------------------------
 
     def receive_all(self, now):
         for addr, data in self.link.receive():
-            # Checked before anything else (before a host takes a sender as its partner): with a secret only
-            # validly signed packets count; without one, signed packets mean the partner set a secret we don't have.
-            if self.auth:
-                data = self.auth.open(data)
-                if data is None:
-                    self.rejected += 1
-                    continue
-            elif data.startswith(Auth.MAGIC):
-                self.rejected += 1
+            self._fresh = False
+            data = self._unseal(addr, data)
+            if data is None:
                 continue
-            try:
-                msg = json.loads(data)
-            except (ValueError, RecursionError):
-                continue            # (RecursionError: one packet of 60000 "[" used to kill the relay)
-            if not isinstance(msg, dict) or msg.get("v") != PROTOCOL:
+            msg = self._parse(data)
+            if msg is None:
                 continue
-            if self.role == "host" and self.peer != addr:
-                # Pinned to the first peer: another sender is only taken once the current one went silent.
-                if self.peer is not None and now - self.last_heard <= PEER_TIMEOUT:
-                    continue
-                self.peer = addr
-                print(f"peer connected: {self.link.describe(addr)}", flush=True)
-            elif self.role != "host" and self.peer != addr:
-                # A guest still looking for its host pins the first friend that answers a ping; it never
-                # answers other guests' pings itself.
-                if self.peer is not None or msg.get("t") != "pong":
-                    continue
-                self.peer = addr
-                print(f"found the host: {self.link.describe(addr)}", flush=True)
-            self.last_heard = now
+            peer = self._join_seen(addr, now, msg)
+            if peer is False:       # this side answers no one else
+                continue
+            if peer is None:        # the player limit is full
+                self.stage.refused += 1
+                continue
+            if self._fresh:
+                print(f"peer connected: {self._who(peer)}", flush=True)
             self.received += 1
-            kind = msg.get("t")
-            if kind == "ping":
-                self.send({"t": "pong", "ts": msg.get("ts")})
-            elif kind == "pong" and isinstance(msg.get("ts"), (int, float)) and not isinstance(msg["ts"], bool) \
-                    and abs(msg["ts"]) < 1e12:
-                # (A 400-digit JSON integer here raised OverflowError and killed the relay.)
-                self.rtt_ms = (now - msg["ts"]) * 1000.0
-            elif kind == "state":
-                if isinstance(msg.get("s"), str) or isinstance(msg.get("n"), str):
-                    self.in_player = msg["s"] if isinstance(msg.get("s"), str) else self.in_player
-                    self.in_enemies = msg["n"] if isinstance(msg.get("n"), str) else self.in_enemies
-                    write_atomic(self.in_path, self.in_player + self.in_enemies)
-                    self.in_blanked = False
-                ev = msg.get("e")
-                if isinstance(ev, dict) and isinstance(ev.get("sid"), str) and isinstance(ev.get("l"), list):
-                    lines = [line for line in ev["l"] if isinstance(line, str)]
-                    _, events = parse_events("\n".join(lines))
-                    last = self.inbox.accept(ev["sid"], events)
-                    self.send({"t": "ack", "sid": ev["sid"], "id": last})
-            elif kind == "ack" and isinstance(msg.get("sid"), str) and isinstance(msg.get("id"), int):
-                # Taken as is, even when lower: a restarted peer relay starts its inbox over and acks 0, and
-                # only then do we resend the events it lost.
-                self.acked[msg["sid"]] = msg["id"]
-            elif kind == "hello" and isinstance(msg.get("cfg"), dict):
-                self.partner_version = clean_token(msg.get("ver"))
-                theirs = {k: clean_token(v).lower() for k, v in msg["cfg"].items() if k in SHARED_SETTINGS}
-                self.mismatch = sorted(k for k in self.settings if k in theirs and theirs[k] != self.settings[k])
+            self._handle(peer, msg, now)   # writes with the names this packet already had; then the names change
+            if self._fresh:
+                self._sync_single()
+
+    def _unseal(self, addr, data):
+        """The packet's payload once it passes the secret check, else None.
+
+        Checked before anything else (before a host takes a sender as a peer): with a secret only validly signed
+        packets count; without one, signed packets mean the peer set a secret we don't have."""
+        if self.auth:
+            opened = self.auth.open(data)
+            if opened is None:
+                self.stage.rejected += 1
+            return opened
+        if data.startswith(Auth.MAGIC):
+            self.stage.rejected += 1
+            return None
+        return data
+
+    @staticmethod
+    def _parse(data):
+        try:
+            msg = json.loads(data)
+        except (ValueError, RecursionError):
+            return None     # (RecursionError: one packet of 60000 "[" used to kill the relay)
+        if not isinstance(msg, dict) or msg.get("v") != PROTOCOL:
+            return None
+        return msg
+
+    def _sync_single(self):
+        """One peer: 1.4.1's files. More than one: one pair per peer, and the peer that had net_in.txt moves over."""
+        want = len(self.stage.peers) <= 1
+        if want == self.single:
+            return
+        self.single = want
+        # The inboxes were made against the old names: rebuild them so nobody writes into a shared file.
+        self.inboxes = {peer.key: EventInbox(self.events_path(peer)) for peer in self.stage.targets()}
+        if want:
+            for had in self.stage.targets():
+                if had.in_player or had.in_enemies:
+                    write_atomic(self.in_path, had.in_player + had.in_enemies)
+                remove_quietly(self.stage.snapshot_path(had))
+        else:
+            for had in self.stage.targets():
+                if had.in_player or had.in_enemies:
+                    write_atomic(self.stage.snapshot_path(had), had.in_player + had.in_enemies)
+            remove_quietly(self.in_path)
+
+    def _handle(self, peer, msg, now):
+        kind = msg.get("t")
+        if kind == "ping":
+            self.send({"t": "pong", "ts": msg.get("ts")}, to=peer)
+        elif kind == "pong" and isinstance(msg.get("ts"), (int, float)) and not isinstance(msg["ts"], bool) \
+                and abs(msg["ts"]) < 1e12:
+            # (A 400-digit JSON integer here raised OverflowError and killed the relay.)
+            peer.rtt_ms = (now - msg["ts"]) * 1000.0
+        elif kind == "state":
+            if isinstance(msg.get("s"), str) or isinstance(msg.get("n"), str):
+                peer.in_player = msg["s"] if isinstance(msg.get("s"), str) else peer.in_player
+                peer.in_enemies = msg["n"] if isinstance(msg.get("n"), str) else peer.in_enemies
+                peer.in_blanked = False
+                if self.single:
+                    write_atomic(self.in_path, peer.in_player + peer.in_enemies)
+                else:
+                    write_atomic(self.stage.snapshot_path(peer), peer.in_player + peer.in_enemies)
+                    self.stage.keep_snapshots()
+            ev = msg.get("e")
+            if isinstance(ev, dict) and isinstance(ev.get("sid"), str) and isinstance(ev.get("l"), list):
+                lines = [line for line in ev["l"] if isinstance(line, str)]
+                _, events = parse_events("\n".join(lines))
+                last = self.inboxes[peer.key].accept(ev["sid"], events)
+                # Only the sender needs this: sent to it alone, never to the rest of the party.
+                self.send({"t": "ack", "sid": ev["sid"], "id": last}, to=peer)
+        elif kind == "ack" and isinstance(msg.get("sid"), str) and isinstance(msg.get("id"), int):
+            # Taken as is, even when lower: a restarted peer relay starts its inbox over and acks 0, and
+            # only then do we resend the events it lost.
+            peer.acked[msg["sid"]] = msg["id"]
+        elif kind == "hello" and isinstance(msg.get("cfg"), dict):
+            peer.partner_version = clean_token(msg.get("ver"))
+            theirs = {k: clean_token(v).lower() for k, v in msg["cfg"].items() if k in SHARED_SETTINGS}
+            peer.mismatch = sorted(k for k in self.settings if k in theirs and theirs[k] != self.settings[k])
+
+    def _join_seen(self, addr, now, msg):
+        """The peer this packet is from; False if it isn't for this side; None if the party is full."""
+        peer = self.stage.one(addr, getattr(self.link, "session", None))
+        if peer is not None:
+            peer.last_heard = now
+            return peer
+        if self.role != "host":
+            # A guest still looking for its host takes the first friend that answers a ping; it never answers
+            # another guest's ping itself.
+            if self.stage.peers or msg.get("t") != "pong":
+                return False
+            peer = self._join(addr, now)
+            self._fresh = peer is not None
+            if peer is not None:
+                print(f"found the host: {self._who(peer)}", flush=True)
+            return peer
+        if len(self.stage.peers) >= self.stage.max_players:
+            return None
+        peer = self._join(addr, now)
+        self._fresh = peer is not None
+        return peer
+
+    # --- the mod's files --------------------------------------------------
 
     def _out_signature(self):
         sig = []
@@ -476,22 +742,25 @@ class Relay:
 
     def tick(self, now):
         self.receive_all(now)
-        if self.peer is not None and self.last_heard > 0 and now - self.last_heard > PEER_TIMEOUT:
-            if not self.in_blanked:
+        for peer in self.stage.targets():
+            if not peer.in_blanked and not peer.alive(now):
                 # The peer is gone: don't leave its last snapshot for the mod to keep applying.
-                write_atomic(self.in_path, "")
-                self.in_player = self.in_enemies = ""
-                self.in_blanked = True
+                path = os.path.join(self.stage.folder, "net_in.txt") if self.single else self.stage.snapshot_path(peer)
+                if write_atomic(path, ""):
+                    peer.in_player = peer.in_enemies = ""
+                    peer.in_blanked = True
+                    self.stage.keep_snapshots()
         if now - self.last_ping >= PING_EVERY:
-            if self.peer is None and self.role != "host":
+            if not self.stage.peers and self.role != "host":
                 for friend in self.link.candidates():
                     self.send({"t": "ping", "ts": now}, to=friend)
             else:
                 self.send({"t": "ping", "ts": now})
             self.last_ping = now
-        if self.peer is not None and now - self.last_hello >= HELLO_EVERY:
-            self.send({"t": "hello", "ver": self.version, "cfg": self.settings})
-            self.last_hello = now
+        for peer in self.stage.targets():
+            if now - peer.last_hello >= HELLO_EVERY:
+                self.send({"t": "hello", "ver": self.version, "cfg": self.settings}, to=peer)
+                peer.last_hello = now
         # Resent if nothing went out since the last tick, so a dropped packet heals itself. wait() sends on change,
         # which is every tick while the mod runs: sending here as well doubled the traffic.
         if time.monotonic() - self.last_state >= TICK:
@@ -500,44 +769,70 @@ class Relay:
     def send_state(self):
         now = time.monotonic()
         self.last_state = now
+        targets = self.stage.targets()
+        if not targets:
+            return
         # Events first: a dead enemy's "K" should arrive before the enemy list that no longer has it.
         session, events = parse_events(read_complete_lines(self.events_out_path))
         if session is not None:
-            acked = self.acked.get(session, 0)
-            pending, size = [], 0
-            for eid, line in events:
-                if eid <= acked:
-                    continue
-                if pending and (len(pending) == MAX_EVENTS_PER_PACKET or size + len(line) > MAX_EVENT_BYTES):
-                    break
-                pending.append(line)
-                size += len(line)
+            # Each peer confirms on its own: one slow guest must not hold back the others.
+            pending_by_peer = {}
+            for peer in targets:
+                acked = peer.acked.get(session, 0)
+                pending, size = [], 0
+                for eid, line in events:
+                    if eid <= acked:
+                        continue
+                    if pending and (len(pending) == MAX_EVENTS_PER_PACKET or size + len(line) > MAX_EVENT_BYTES):
+                        break
+                    pending.append(line)
+                    size += len(line)
+                pending_by_peer[peer.key] = pending
+                peer.events_acked = acked
             # The session is repeated even with nothing pending, so the peer's inbox follows restarts.
-            if pending or now - self.last_session >= SESSION_EVERY:
-                self.send({"t": "state", "e": {"sid": session, "l": pending}})
+            if now - self.last_session >= SESSION_EVERY:
+                for peer in targets:
+                    self.send({"t": "state", "e": {"sid": session, "l": pending_by_peer[peer.key]}}, to=peer)
                 self.last_session = now
-            self.events_acked = acked
+            else:
+                for peer in targets:
+                    if pending_by_peer[peer.key]:
+                        self.send({"t": "state", "e": {"sid": session, "l": pending_by_peer[peer.key]}}, to=peer)
         snapshot = read_text(self.out_path)
         if snapshot.strip():
             player, enemies = split_snapshot(snapshot[:MAX_SNAPSHOT_BYTES])
             self.send({"t": "state", "s": player})
-            if (enemies or self.enemies_sent) and now - self.last_enemies >= ENEMY_EVERY:
-                self.send({"t": "state", "n": enemies})
-                self.last_enemies = now
-                self.enemies_sent = bool(enemies)
+            if enemies or any(peer.enemies_sent for peer in targets):
+                if now - max(peer.last_enemies for peer in targets) >= ENEMY_EVERY:
+                    self.send({"t": "state", "n": enemies})
+                    for peer in targets:
+                        peer.last_enemies = now
+                        peer.enemies_sent = bool(enemies)
 
     def status(self, now):
-        connected = self.peer is not None and now - self.last_heard <= PEER_TIMEOUT
-        peer = self.link.describe(self.peer).replace(" ", "_") if self.peer else "-"
-        rtt = f"{self.rtt_ms:.0f}" if self.rtt_ms is not None else "-"
+        going = [p for p in self.stage.targets() if p.alive(now)]
+        connected = bool(self.stage.peers) and (self.role == "host" or bool(going))
+        peer = self.link.describe(self.peer.addr).replace(" ", "_") if self.peer else "-"
+        rtt = format_rtt(self.peer.rtt_ms) if self.peer else "-"
         # time= (wall clock) lets the mod tell a running relay from a stale status file before starting another.
         via = "steam" if isinstance(self.link, SteamLink) else "udp"
-        return (f"role={self.role} via={via} connected={'yes' if connected else 'no'} peer={peer} "
+        line = (f"role={self.role} via={via} connected={'yes' if connected else 'no'} peer={peer} "
                 f"rtt_ms={rtt} sent={self.sent} received={self.received} "
                 f"filtered={getattr(self.link, 'filtered', 0)} rejected={self.rejected} "
                 f"auth={'on' if self.auth else 'off'} version={self.version} "
-                f"partner_version={self.partner_version or '-'} mismatch={','.join(self.mismatch) or '-'} "
-                f"events_acked={self.events_acked} events_in={self.inbox.last_id} time={int(time.time())}")
+                f"partner_version={(self.peer.partner_version if self.peer else None) or '-'} "
+                f"mismatch={','.join(self.peer.mismatch) if self.peer else '-'} "
+                f"events_acked={(self.peer.events_acked if self.peer else 0)} events_in={self.inbox.last_id} ")
+        if len(self.stage.peers) > 1 or not self.single:
+            line += f"peers={len(self.stage.peers)} max_players={self.stage.max_players} "
+            line += " ".join(f"peer{k}={p.key},"
+                             f"{'up' if p.alive(now) else 'gone'},{format_rtt(p.rtt_ms)}"
+                             for k, p in enumerate(self.stage.peers.values(), 1)) + " "
+        return line + f"time={int(time.time())}"
+
+
+def format_rtt(rtt):
+    return f"{rtt:.0f}" if rtt is not None else "-"
 
 
 ECHO_OFFSET_X = 300.0   # cm
@@ -730,6 +1025,8 @@ def main():
                                   "both players should share are read from it (the secret stays off the command line)")
     ap.add_argument("--mod-version", default="?", help="the mod's version, told to the partner")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--max-players", type=int, default=2,
+                    help="how many players one host serves, itself included (2 = one host and one guest, as before)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = run until Ctrl+C)")
     ap.add_argument("--alive-file", help="stop once this file (the mod's heartbeat: a unix time) is older than "
                                          "--alive-timeout, i.e. the game was closed")
@@ -754,12 +1051,19 @@ def main():
     if ini.get("allowanyaddress", "off").lower() in ("on", "yes", "true", "1"):
         # A virtual LAN with unusual addresses (UU Accelerator's multiplayer, ZeroTier...): the player opened it.
         args.allow = "any"
+    # MaxPlayers counts players, the host included (2 = one host, one guest), as native/relay.hpp reads it. The
+    # command line wins when it was given: --max-players is for tests.
+    if "--max-players" not in sys.argv:
+        try:
+            args.max_players = max(1, int(ini.get("maxplayers", 2)))
+        except ValueError:
+            pass
     secret = ini.get("secret", "")
     if secret.upper().startswith("PUT-") or secret.lower() in ("", "off", "none"):
         secret = None
     link = SteamLink(args.role, args.peer, args.dir) if args.transport == "steam" else None
     relay = Relay(args.role, args.dir, args.peer, args.port, link, allow=args.allow, secret=secret,
-                  settings=ini, version=args.mod_version)
+                  settings=ini, version=args.mod_version, max_players=args.max_players)
     print(f"PBZCoop relay {args.role} on {relay.link.describe_self()}, files in {args.dir}"
           f"{', packets signed (Secret set)' if secret else ''}", flush=True)
     fine_timer(True)
@@ -769,6 +1073,8 @@ def main():
         while True:
             now = time.monotonic()
             relay.tick(now)
+            relay.stage.prune(now)
+            relay._sync_single()
             if now - last_status >= 1.0:
                 line = relay.status(now)
                 write_atomic(relay.status_path, line + "\n")

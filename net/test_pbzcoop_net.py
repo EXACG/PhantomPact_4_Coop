@@ -41,6 +41,9 @@ def wait_for(pred, timeout=5.0):
     return pred()
 
 
+PROTOCOL = 3   # the wire the relay and these packets speak (native/relay.hpp: PROTOCOL)
+
+
 def event_lines(path):
     return [line for line in read(path).splitlines() if line and line[0].isdigit()]
 
@@ -142,6 +145,90 @@ def load_relay_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class PartyLoopback(unittest.TestCase):
+    """Three real relays, three sockets: a host with two guests, the stage 1 of docs/MULTIPLAYER.md."""
+
+    PORT = 47951
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.host = os.path.join(self.tmp.name, "host")
+        self.g1 = os.path.join(self.tmp.name, "g1")
+        self.g2 = os.path.join(self.tmp.name, "g2")
+        for d in (self.host, self.g1, self.g2):
+            os.makedirs(d)
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            p.kill()
+            p.wait()
+        self.tmp.cleanup()
+
+    def start(self, *args):
+        command = [NATIVE] if NATIVE and args[0] in NATIVE_ROLES else [sys.executable, "-I", RELAY]
+        p = subprocess.Popen([*command, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs.append(p)
+        return p
+
+    def one_peer_file(self, folder):
+        """The snapshot file the mod reads when a host has one guest, whichever name it has."""
+        names = [n for n in os.listdir(folder) if n.startswith("net_in") and n.endswith(".txt")]
+        return os.path.join(folder, names[0]) if names else os.path.join(folder, "net_in.txt")
+
+    def test_two_guests_each_get_their_own_files(self):
+        write(os.path.join(self.host, "net_out.txt"), "P 1 10.0 20.0 30.0 90.0 0 0\nE Mob_1 1 2 3 4 50 100 1\n")
+        write(os.path.join(self.host, "net_events_out.txt"), "S h1\n1 K Mob_1\n")
+        write(os.path.join(self.g1, "net_out.txt"), "P 3 1.0 1.0 1.0 0.0 0 0\n")
+        write(os.path.join(self.g2, "net_out.txt"), "P 5 5.0 5.0 5.0 0.0 0 0\n")
+        write(os.path.join(self.g1, "net_events_out.txt"), "S g1\n1 D Mob_1 25\n")
+        write(os.path.join(self.g2, "net_events_out.txt"), "S g2\n1 D Mob_1 30\n")
+        self.start("host", "--dir", self.host, "--port", str(self.PORT), "--max-players", "3")
+        self.start("client", "--dir", self.g1, "--peer", "127.0.0.1", "--port", str(self.PORT))
+        self.start("client", "--dir", self.g2, "--peer", "127.0.0.1", "--port", str(self.PORT))
+
+        # Both guests see the host's world, and the host gets one snapshot file per guest.
+        for g in (self.g1, self.g2):
+            self.assertTrue(wait_for(lambda g=g: "E Mob_1" in read(self.one_peer_file(g))),
+                            f"{os.path.basename(g)} never got the host's snapshot")
+            self.assertTrue(wait_for(lambda g=g: len(event_lines(os.path.join(g, "net_events_in.txt"))) == 1))
+        self.assertTrue(wait_for(lambda: len([n for n in os.listdir(self.host) if n.startswith("net_in_")]) == 2),
+                        "the host kept one file per guest")
+        self.assertTrue(wait_for(lambda: "peers=2" in read(os.path.join(self.host, "net_status.txt"))),
+                        "net_status.txt should say how many are in the party")
+        self.assertIn("max_players=3", read(os.path.join(self.host, "net_status.txt")))
+
+        # The guests' events keep their own files: two "1 ..." ids must not collide in one inbox.
+        def both_guests_events():
+            got = [line for n in os.listdir(self.host) if n.startswith("net_events_in_")
+                   for line in event_lines(os.path.join(self.host, n))]
+            return sorted(got) == ["1 D Mob_1 25", "1 D Mob_1 30"]
+
+        self.assertTrue(wait_for(both_guests_events),
+                        "each guest's event went to its own inbox, ids and all")
+
+    def test_a_guest_leaving_leaves_the_other_connected(self):
+        write(os.path.join(self.host, "net_out.txt"), "P 1 10.0 20.0 30.0 90.0 0 0\n")
+        write(os.path.join(self.g1, "net_out.txt"), "P 3 1.0 1.0 1.0 0.0 0 0\n")
+        write(os.path.join(self.g2, "net_out.txt"), "P 5 5.0 5.0 5.0 0.0 0 0\n")
+        self.start("host", "--dir", self.host, "--port", str(self.PORT), "--max-players", "3")
+        self.start("client", "--dir", self.g1, "--peer", "127.0.0.1", "--port", str(self.PORT))
+        g2 = self.start("client", "--dir", self.g2, "--peer", "127.0.0.1", "--port", str(self.PORT))
+        self.assertTrue(wait_for(lambda: "E" in read(self.one_peer_file(self.g1)) or
+                                 read(self.one_peer_file(self.g1)).startswith("P 1")))
+        self.assertTrue(wait_for(lambda: read(self.one_peer_file(self.g2)).startswith("P 1")))
+        g2.kill()
+        g2.wait()
+        # The host keeps serving the guest that stayed, and forgets the one that left.
+        self.assertTrue(wait_for(lambda: "P 3 1.0" in "".join(
+            read(os.path.join(self.host, n)) for n in os.listdir(self.host) if n.startswith("net_in"))))
+        mark = read(os.path.join(self.g1, "net_in.txt"))
+        write(os.path.join(self.host, "net_out.txt"), "P 9 99.0 20.0 30.0 90.0 0 0\n")
+        self.assertTrue(wait_for(lambda: "P 9 99.0" in read(self.one_peer_file(self.g1))),
+                        "the guest that stayed stopped getting updates")
+        self.assertIn(mark.split("\n")[0][:3], mark)   # and what it had was really the host's snapshot
 
 
 class FileReading(unittest.TestCase):
@@ -303,8 +390,8 @@ class SteamRelayLogic(unittest.TestCase):
             # The guest has two friends in the game; only the host answers pings, so it pins the host.
             guest = relay.Relay("client", gd, None, 0, net.link(self.GUEST, [self.OTHER, self.HOST]))
             self.run_relays([host, guest])
-            self.assertEqual(guest.peer, self.HOST)
-            self.assertEqual(host.peer, self.GUEST)
+            self.assertEqual(guest.peer.addr, self.HOST)
+            self.assertEqual(host.peer.addr, self.GUEST)
             self.assertIn("E sp:Boss", read(os.path.join(gd, "net_in.txt")))
             self.assertIn("P 1 11 21 31", read(os.path.join(hd, "net_in.txt")))
             self.assertEqual(event_lines(os.path.join(gd, "net_events_in.txt")), ["1 B sp:Boss", "2 K sp:Thug"])
@@ -322,10 +409,28 @@ class SteamRelayLogic(unittest.TestCase):
             self.run_relays([host, g1], 0.6)
             g2 = relay.Relay("client", g2d, None, 0, net.link(self.OTHER, [self.GUEST, self.HOST]))
             self.run_relays([host, g1, g2], 1.5)
-            self.assertEqual(g1.peer, self.HOST)
-            self.assertEqual(host.peer, self.GUEST)    # pinned to the first guest while it keeps talking
-            self.assertNotEqual(g2.peer, self.GUEST)   # a guest never answers another guest's pings
-            self.assertIsNone(g2.peer)                 # the busy host doesn't take a second guest
+            self.assertEqual(g1.peer.addr, self.HOST)
+            self.assertIn(self.GUEST, [p.addr for p in host.peers.values()])   # the first guest keeps its slot
+            self.assertEqual(len(host.peers), 2, "a second guest joins when the host has room for it")
+            self.assertEqual(g2.peer.addr, self.HOST)                          # never another guest
+            self.assertNotIn(self.GUEST, [p.addr for p in g2.peers.values()])
+
+    def test_a_host_with_no_room_turns_the_extra_guest_away(self):
+        relay = load_relay_module()
+        net = FakeSteamNet()
+        with tempfile.TemporaryDirectory() as tmp:
+            hd, g1d, g2d = self.folders(tmp, "host", "g1", "g2")
+            for d in (hd, g1d, g2d):
+                write(os.path.join(d, "net_out.txt"), "P 1 0 0 0 0 0 850 850 M\n")
+            host = relay.Relay("host", hd, None, 0, net.link(self.HOST, [self.GUEST, self.OTHER]), max_players=1)
+            g1 = relay.Relay("client", g1d, None, 0, net.link(self.GUEST, [self.HOST]))
+            self.run_relays([host, g1], 0.6)
+            g2 = relay.Relay("client", g2d, None, 0, net.link(self.OTHER, [self.HOST]))
+            self.run_relays([host, g1, g2], 1.5)
+            self.assertEqual(list(host.peers.values())[0].addr, self.GUEST)
+            self.assertEqual(len(host.peers), 1, "max_players caps the party")
+            self.assertGreater(host.stage.refused, 0, "and the extra guest shows up in net_status.txt")
+            self.assertIsNone(g2.peer, "the guest with no room never gets a host")
 
     def test_guest_given_a_steamid_talks_only_to_it(self):
         relay = load_relay_module()
@@ -337,7 +442,7 @@ class SteamRelayLogic(unittest.TestCase):
             host = relay.Relay("host", hd, None, 0, net.link(self.HOST, []))
             guest = relay.Relay("client", gd, None, 0, net.link(self.GUEST, [], peer=self.HOST))
             self.run_relays([host, guest])
-            self.assertEqual(guest.peer, self.HOST)
+            self.assertEqual(guest.peer.addr, self.HOST)
             self.assertIn("P 7 1 2 3", read(os.path.join(gd, "net_in.txt")))
 
 
@@ -380,8 +485,8 @@ class Security(unittest.TestCase):
         net = FakeSteamNet()
         with tempfile.TemporaryDirectory() as tmp:
             r = relay.Relay("host", tmp, None, 0, net.link(1, []))
-            net.inbox[1].append((2, b'{"v":2,"t":"pong","ts":' + b"9" * 400 + b"}"))
-            net.inbox[1].append((2, b'{"v":2,"t":"pong","ts":true}'))
+            net.inbox[1].append((2, b'{"v":3,"t":"pong","ts":' + b"9" * 400 + b"}"))
+            net.inbox[1].append((2, b'{"v":3,"t":"pong","ts":true}'))
             r.receive_all(time.monotonic())          # must not raise
             self.assertIsNone(r.rtt_ms)
 
@@ -447,7 +552,7 @@ class Security(unittest.TestCase):
 
 def json_bytes(obj):
     import json
-    return json.dumps(obj).encode()
+    return json.dumps(dict(obj, v=PROTOCOL)).encode()
 
 
 class SecretLoopback(RelayLoopback):

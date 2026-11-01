@@ -1,5 +1,6 @@
--- How your partner is doing, as short tips (the game's ink-bar tip, see status.lua): partner down, partner back,
--- partner watching a cutscene, and the two of you far apart in the same area.
+-- How your partners are doing, as short tips (the game's ink-bar tip, see status.lua): one down, one back, one
+-- watching a cutscene, and how far away they are in the same area. With more than one partner every one of them is
+-- watched on its own (docs/MULTIPLAYER.md, stage 5).
 -- (From appdoze's PR #5, without its regroup teleport, which stays deferred: see docs/reviews.)
 -- Each player's death and respawn stay their own game's; there is no revive. Spectating is in coop.lua.
 
@@ -13,6 +14,7 @@ return function(api)
     local FAR_CM = 15000            -- "far apart" above 150 m (same area)
 
     local partner = { down = false, zeroReads = 0, far = false, cine = false }
+    local perPeer = {}              -- peer key -> { zeroReads, down, far, cine }
     local nextPoll = 0
 
     local function tip(key, text)
@@ -23,39 +25,49 @@ return function(api)
         end
     end
 
-    local function fresh()
-        return net.enabled and not net.partnerGone and net.target ~= nil and net.lastRemoteAt ~= nil
-            and os.clock() - net.lastRemoteAt <= FRESH_S
+    local function whose(p)
+        return p.name or p.key
     end
 
     -- Down after two reads in a row at 0 health (one bad read during a teleport isn't "down"); back when health
     -- returns.
-    local function check()
-        if not fresh() then
+    local function check(p)
+        local fresh = net.enabled and not p.gone and p.target and p.lastRemoteAt
+            and os.clock() - p.lastRemoteAt <= FRESH_S
+        if not fresh then
             return
         end
-        local t = net.target
+        local st = perPeer[p.key]
+        if st == nil then
+            st = { zeroReads = 0, down = false, far = false, cine = false }
+            perPeer[p.key] = st
+        end
+        local t = p.target
         if not (t.MaxHp and t.MaxHp > 0 and t.Hp) then
             return
         end
+        local multiple = net.peerCount and net.peerCount > 1
+        local name = multiple and (" (" .. whose(p) .. ")") or ""
         if t.Hp <= 0 then
-            partner.zeroReads = partner.zeroReads + 1
-            if partner.zeroReads >= 2 and not partner.down then
-                partner.down = true
-                tip("partner", "your partner is down.")
+            st.zeroReads = st.zeroReads + 1
+            if st.zeroReads >= 2 and not st.down then
+                st.down = true
+                p.downed = true
+                tip("partner", "your partner" .. name .. " is down.")
             end
             return
         end
-        partner.zeroReads = 0
-        if partner.down then
-            partner.down = false
-            tip("partner", "your partner is back.")
+        st.zeroReads = 0
+        if st.down then
+            st.down = false
+            p.downed = false
+            tip("partner", "your partner" .. name .. " is back.")
             return
         end
-        if t.Cine ~= partner.cine then
-            partner.cine = t.Cine
+        if t.Cine ~= st.cine then
+            st.cine = t.Cine
             if t.Cine then
-                tip("cine", "your partner is watching a cutscene.")
+                tip("cine", "your partner" .. name .. " is watching a cutscene.")
             end
         end
         -- Far apart in the same area: one tip each time you drift apart.
@@ -64,10 +76,10 @@ return function(api)
             local l = pawn:K2_GetActorLocation()
             local d = math.sqrt((l.X - t.X) ^ 2 + (l.Y - t.Y) ^ 2)
             local far = d > FAR_CM
-            if far and not partner.far then
-                tip("far", string.format("your partner is %d m away.", math.floor(d / 100)))
+            if far and not st.far then
+                tip("far", string.format("your partner%s is %d m away.", name, math.floor(d / 100)))
             end
-            partner.far = far
+            st.far = far
         end
     end
 
@@ -77,19 +89,38 @@ return function(api)
             return
         end
         nextPoll = now + POLL_S
-        check()
+        for _, p in ipairs(coop.peerList()) do
+            check(p)
+        end
+        for key in pairs(perPeer) do
+            local alive = false
+            for _, p in ipairs(coop.peerList()) do
+                if p.key == key then
+                    alive = true
+                end
+            end
+            if not alive then
+                perPeer[key] = nil
+            end
+        end
     end
 
-    -- partner: print what the mod knows about your partner
+    -- partner: print what the mod knows about your partners
     function partner.command()
-        local t = net.target
-        if not fresh() then
-            log("Partner: no recent position" .. (net.partnerGone and " (gone)." or "."))
-            return
+        for _, p in ipairs(coop.peerList()) do
+            local t = p.target
+            if t == nil or p.lastRemoteAt == nil or p.gone or os.clock() - p.lastRemoteAt > FRESH_S then
+                log("Partner " .. whose(p) .. ": no recent position" .. (p.gone and " (gone)." or "."))
+            else
+                log(string.format("Partner %s: %s, health %s/%s, area %s%s%s", whose(p),
+                    (p.downed or (t.Hp and t.Hp <= 0)) and "down" or "up", tostring(t.Hp), tostring(t.MaxHp),
+                    tostring(t.Map), t.Map == net.localMap and " (same as yours)" or "",
+                    t.Cine and ", in a cutscene" or ""))
+            end
         end
-        log(string.format("Partner: %s, health %s/%s, area %s%s%s", partner.down and "down" or "up", tostring(t.Hp),
-            tostring(t.MaxHp), tostring(t.Map), t.Map == net.localMap and " (same as yours)" or "",
-            t.Cine and ", in a cutscene" or ""))
+        if #coop.peerList() == 0 then
+            log("Partner: nobody connected.")
+        end
     end
 
     return partner
