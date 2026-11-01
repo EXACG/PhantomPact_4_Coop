@@ -5,7 +5,9 @@
 -- and the timer, and the partner's PC only says "I swung at you". Nothing here writes to a save: the health floor,
 -- the invulnerability and the input block are runtime state, and a save veto keeps autosaves out while you're down.
 --
--- Events: DOWN <points> (I'm down), G <points> <total> <seconds|-1> (my gauge), STRIKE (I swung at you), UP, OUT.
+-- Events: DOWN <points> (I'm down), RG <points> <total> <seconds|-1> (my gauge), STRIKE (I swung at you), UP,
+-- OUT. (The gauge is RG, not G: coop.lua's G is "the guest killed this enemy", and two handlers on one name
+-- meant this file quietly replaced that one - a guest's kill never reached the host.)
 
 return function(api)
     local log, valid, game = api.log, api.valid, api.game
@@ -238,7 +240,7 @@ return function(api)
         revive.gauge = { points = points, total = total, bars = downs, seconds = timed and timeLeft or nil }
         if now >= nextGauge then
             nextGauge = now + GAUGE_EVERY_S
-            coop.sendEvent("G", string.format("%.1f", points), total, timed and string.format("%.1f", timeLeft) or -1)
+            coop.sendEvent("RG", string.format("%.1f", points), total, timed and string.format("%.1f", timeLeft) or -1)
         end
         if not fresh() then
             die(pc, pawn, "your partner is gone.")
@@ -355,7 +357,7 @@ return function(api)
         end
     end
 
-    coop.handlers.G = function(rest)
+    coop.handlers.RG = function(rest)
         local p, t, s = rest:match("^(%S+) (%S+) (%S+)$")
         p, t, s = tonumber(p), tonumber(t), tonumber(s)
         if net.partnerDowned and p and t and s and t > 0 then

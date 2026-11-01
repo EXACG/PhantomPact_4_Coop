@@ -681,7 +681,7 @@ private:
     }
 
     EventInbox* inbox() {
-        static EventInbox none(std::wstring());
+        static EventInbox none{std::wstring()};
         if (peers_.empty()) return &none;
         return inboxes_[peers_.begin()->first].get();
     }
@@ -822,7 +822,13 @@ private:
                 known->last_heard = now;
                 peer = known;
             } else if (role_ == "host") {
-                if (peers_.size() >= static_cast<size_t>(max_players_)) {
+                // MaxPlayers counts the host too: a host with 2 takes one guest, not two (the same limit the
+                // Python relay applies). Only live peers take a slot, so a guest whose relay restarted gets back in
+                // without waiting out PRUNE_AFTER.
+                size_t live = 0;
+                for (const auto& [key, p] : peers_)
+                    if (p.alive(now)) ++live;
+                if (live >= static_cast<size_t>(std::max(0, max_players_ - 1))) {
                     refused_++;
                     continue;
                 }
@@ -957,6 +963,7 @@ struct Options {
     double seconds = 0;            // 0 = until the heartbeat stops
     std::wstring alive_file;
     double alive_timeout = ALIVE_TIMEOUT;
+    int max_players = 0;           // 0 = PhantomPact.ini's MaxPlayers (the command line is for tests)
 };
 
 // The mod rewrites its heartbeat file (a unix time) every few seconds while the game runs. It truncates, then
@@ -993,7 +1000,8 @@ inline void run(Options o, const std::function<void(const std::string&)>& log) {
         if (o.transport == "steam") link = make_steam_link(o.role, o.peer);
         else link = std::make_unique<UdpLink>(o.role, o.peer, o.port, o.allow_any);
         int max_players = 2;     // MaxPlayers counts players, the host included: 2 = the old one host, one guest
-        if (auto it = ini.find("maxplayers"); it != ini.end()) {
+        if (o.max_players > 0) max_players = o.max_players;
+        if (auto it = ini.find("maxplayers"); it != ini.end() && o.max_players <= 0) {
             try {
                 max_players = std::max(1, std::stoi(it->second));
             } catch (const std::exception&) {

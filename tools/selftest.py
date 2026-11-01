@@ -5,6 +5,10 @@ Exit code 0 means the relay and the mod's Lua are good enough to hand to someone
 one-off checks that used to be run by hand, one at a time:
   lua      every Scripts/*.lua compiles (luac, if it's on the path; otherwise a strict syntax pass)
   relay    net/test_pbzcoop_net.py: the relay tests, the three-relay party tests and the packet fuzzers
+  party    tools/party_harness.py: three real relays, three copies of coop.lua in a real Lua (lupa): the party
+           files, ghosts per peer, a guest's hit and move, difficulty by headcount, one player leaving
+  events   one handler per event name, and a handler for every event the mod sends (a second handler on one name
+           silently replaces the first: revive.lua's gauge used to take coop.lua's "G", so a guest's kill was lost)
   files    the mod folder's contract with the relay (the "net_*.txt" names docs/MULTIPLAYER.md promises)
   docs     docs/MULTIPLAYER.md still describes the code it points at (file:line references resolve)
   native   native/relay.hpp and net/pbzcoop_net.py promise the same things (a build needs Windows: see the tools)
@@ -37,8 +41,32 @@ def run(title, argv, cwd=ROOT):
     return proc
 
 
+def lua_with_lupa(files):
+    """A real compile in a real Lua, without luac: lupa carries the same parser the game's Lua uses."""
+    try:
+        from lupa import LuaRuntime
+    except ImportError:
+        return False
+    lua = LuaRuntime(unpack_returned_tuples=True)
+    check = lua.eval("function(src, name) local fn, err = load(src, name) "
+                     "if fn then return true, nil end return false, tostring(err) end")
+    bad = []
+    for path in files:
+        ok, err = check(open(path, encoding="utf-8").read(), path)
+        if not ok:
+            bad.append(f"{os.path.basename(path)}: {err}")
+    if bad:
+        failures.append("lua")
+        print("== lua: lupa found syntax errors:", flush=True)
+        for line in bad:
+            print("   " + line, flush=True)
+    else:
+        print(f"== lua: {len(files)} scripts compile (lupa, a real Lua)", flush=True)
+    return True
+
+
 def lua_compiles():
-    """luac if it exists (a real compile), else a structural pass: no stray 'end', balanced blocks."""
+    """A real compile: luac, then lupa, then a structural pass (no stray 'end', balanced blocks)."""
     files = sorted(glob.glob(os.path.join(SCRIPTS, "*.lua")))
     if not files:
         failures.append("lua")
@@ -46,10 +74,17 @@ def lua_compiles():
         return
     try:
         subprocess.run(["luac", "-v"], capture_output=True, check=True)
-        run("lua", ["luac", "-p", *files])
+        # One file per run: luac 5.4.4 can abort on "luac -p a.lua b.lua" (double free in its output buffer).
+        before = len(failures)
+        for path in files:
+            run("lua", ["luac", "-p", path])
+        if len(failures) == before:
+            print("   compiled", len(files), "scripts", flush=True)
         return
     except (OSError, subprocess.CalledProcessError):
         pass
+    if lua_with_lupa(files):
+        return
     opens = re.compile(r"\b(function|if|for|while|do|repeat)\b")
     bad = []
     for path in files:
@@ -69,6 +104,48 @@ def lua_compiles():
             print("   " + line, flush=True)
     else:
         print("== lua: luac isn't installed; structural pass ok (install Lua for a real compile)", flush=True)
+
+
+def event_handlers():
+    """Every event name the mod sends has a handler, and no two files take the same name.
+
+    Handlers live in one table (coop.handlers = handlers), and a module that assigns a name twice takes the first
+    one's place without saying so: revive.lua's revive gauge was "G", coop.lua's "G" is "the guest killed this
+    enemy", and the guest's kill never reached the host. Only a check can notice that."""
+    sources = {}
+    for path in sorted(glob.glob(os.path.join(SCRIPTS, "*.lua"))):
+        sources[os.path.basename(path)] = open(path, encoding="utf-8", errors="replace").read()
+    # A handler assignment: "handlers.X = function" / "coop.handlers.X = function", and the wrapped ones
+    # (moves.lua re-assigns M after keeping the old one) are counted where they're assigned too.
+    assigned = {}
+    wraps = set()          # (file, name) pairs that keep the handler they replace: "local old = coop.handlers.M"
+    for name, text in sources.items():
+        for match in re.finditer(r"(?:coop\.)?handlers\.(\w+)\s*=(?!=)", text):
+            assigned.setdefault(match.group(1), set()).add(name)
+            if re.search(r"=\s*coop\.handlers\." + match.group(1) + r"\b", text):
+                wraps.add((name, match.group(1)))
+    sent = {}
+    for name, text in sources.items():
+        for match in re.finditer(r"\bsendEvent\(\s*\"([^\"]+)\"", text):
+            sent.setdefault(match.group(1), set()).add(name)
+        # (The forwarded copies are built from a handler's own name: sendEvent(kind:lower(), ...) in coop.lua.)
+    problems = []
+    for key, where in sorted(assigned.items()):
+        # Two files on one name is a bug unless the second one saved the first (moves.lua wraps coop.lua's M to
+        # decide whether to replay an ability or a montage); nothing else may take a name over.
+        unwrapped = [name for name in where if (name, key) not in wraps]
+        if len(unwrapped) > 1:
+            problems.append(f"{key}: handled in {', '.join(sorted(unwrapped))}")
+    for key in sorted(sent):
+        if key not in assigned and key.lower() not in assigned:
+            problems.append(f"{key}: sent by {', '.join(sorted(sent[key]))}, nobody handles it")
+    if problems:
+        failures.append("events")
+        print("== events: the mod's event names don't line up:", flush=True)
+        for line in problems:
+            print("   " + line, flush=True)
+    else:
+        print(f"== events: {len(assigned)} handlers, one per name, all {len(sent)} sent names covered", flush=True)
 
 
 def mod_files():
@@ -146,6 +223,10 @@ def main():
         lua_compiles()
     if not only or "relay" in only:
         run("relay", [sys.executable, "-I", os.path.join(ROOT, "net", "test_pbzcoop_net.py")])
+    if not only or "party" in only:
+        run("party", [sys.executable, "-I", os.path.join(ROOT, "tools", "party_harness.py")])
+    if not only or "events" in only:
+        event_handlers()
     if not only or "files" in only:
         mod_files()
     if not only or "docs" in only:

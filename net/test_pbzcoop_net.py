@@ -404,7 +404,8 @@ class SteamRelayLogic(unittest.TestCase):
             hd, g1d, g2d = self.folders(tmp, "host", "g1", "g2")
             for d in (hd, g1d, g2d):
                 write(os.path.join(d, "net_out.txt"), "P 1 0 0 0 0 0 850 850 M\n")
-            host = relay.Relay("host", hd, None, 0, net.link(self.HOST, [self.GUEST, self.OTHER]))
+            # max_players counts the host itself, so 3 = the host and two guests.
+            host = relay.Relay("host", hd, None, 0, net.link(self.HOST, [self.GUEST, self.OTHER]), max_players=3)
             g1 = relay.Relay("client", g1d, None, 0, net.link(self.GUEST, [self.OTHER, self.HOST]))
             self.run_relays([host, g1], 0.6)
             g2 = relay.Relay("client", g2d, None, 0, net.link(self.OTHER, [self.GUEST, self.HOST]))
@@ -422,13 +423,14 @@ class SteamRelayLogic(unittest.TestCase):
             hd, g1d, g2d = self.folders(tmp, "host", "g1", "g2")
             for d in (hd, g1d, g2d):
                 write(os.path.join(d, "net_out.txt"), "P 1 0 0 0 0 0 850 850 M\n")
-            host = relay.Relay("host", hd, None, 0, net.link(self.HOST, [self.GUEST, self.OTHER]), max_players=1)
+            # max_players counts the host itself: 2 = the host and one guest, so the second guest is turned away.
+            host = relay.Relay("host", hd, None, 0, net.link(self.HOST, [self.GUEST, self.OTHER]), max_players=2)
             g1 = relay.Relay("client", g1d, None, 0, net.link(self.GUEST, [self.HOST]))
             self.run_relays([host, g1], 0.6)
             g2 = relay.Relay("client", g2d, None, 0, net.link(self.OTHER, [self.HOST]))
             self.run_relays([host, g1, g2], 1.5)
             self.assertEqual(list(host.peers.values())[0].addr, self.GUEST)
-            self.assertEqual(len(host.peers), 1, "max_players caps the party")
+            self.assertEqual(len(host.peers), 1, "max_players caps the party (counting the host)")
             self.assertGreater(host.stage.refused, 0, "and the extra guest shows up in net_status.txt")
             self.assertIsNone(g2.peer, "the guest with no room never gets a host")
 
@@ -627,9 +629,10 @@ class NativeRelay(RelayLoopback):
             time.sleep(0.5)
         self.assertIsNone(host.poll(), "bad packets stopped the relay")
         self.start("client", "--dir", self.b, "--peer", "127.0.0.1", "--port", str(port))
-        # The fake sender was taken as the partner: it has to go silent for PEER_TIMEOUT first.
-        self.assertTrue(wait_for(lambda: read(os.path.join(self.b, "net_in.txt")).startswith("P 1"), timeout=10.0))
-        self.assertTrue(wait_for(lambda: read(os.path.join(self.a, "net_in.txt")).startswith("P 7"), timeout=10.0))
+        # The fake sender was taken as the partner: it has to go silent for PRUNE_AFTER, not just PEER_TIMEOUT,
+        # before its slot frees up for the real client.
+        self.assertTrue(wait_for(lambda: read(os.path.join(self.b, "net_in.txt")).startswith("P 1"), timeout=25.0))
+        self.assertTrue(wait_for(lambda: read(os.path.join(self.a, "net_in.txt")).startswith("P 7"), timeout=25.0))
         self.assertIsNone(host.poll())
 
     def test_crlf_and_bad_utf8_from_the_mod_arrive_clean(self):

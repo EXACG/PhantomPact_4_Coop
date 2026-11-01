@@ -1480,12 +1480,14 @@ return function(api)
             log("Sending: sequence " .. cine .. ", movement mode " .. tostring(mode) .. ".")
             net.lastCine, net.lastMode = cine, mode
         end
-        -- With a party (three players or more) the line carries our own id, so the others can tell us apart in the
-        -- host's forwarded lines. Two players keep 1.4.1's snapshot byte for byte (docs/MULTIPLAYER.md, stage 1).
+        -- The line ends with our own id, always: the host has to know a guest's id to forward that guest to the other
+        -- guests ("Q <id> ..."), and a guest can't tell whether the host has a party (its own relay names its files
+        -- for one peer whatever the host has). An extra field is ignored by anything that doesn't expect it, so a
+        -- two-player session still works with an older mod on the other side (docs/MULTIPLAYER.md, stage 2).
         local party = net.mode == "party"
         local head = string.format("P %d %.1f %.1f %.1f %.1f %.0f %.1f %.1f %s - %d %d",
             net.seq, loc.X, loc.Y, loc.Z, yaw, speed, hp or 0, maxhp or 0, net.localMap, cine, grounded)
-        local lines = { party and (head .. " " .. net.selfId) or head }
+        local lines = { net.selfId and (head .. " " .. net.selfId) or head }
         if isHost() then
             -- Each guest's latest "P" line, forwarded as "Q <their id> <the line>": a guest only ever gets the
             -- host's files from the relay, so this is how one guest sees another (docs/MULTIPLAYER.md, stage 2).
@@ -1593,12 +1595,13 @@ return function(api)
                 applyPlayerLine(p, line)
             elseif kind == "Q" then
                 -- Another player's position, forwarded by the host: a ghost we steer but have no files for.
-                local id, rest = line:match("^Q (%S+) (.*)$")
-                if id and rest ~= "" and id ~= net.selfId then   -- our own copy: we have no ghost of ourselves
+                local id, rest = line:match("^Q (%S+) (%S+.*)$")
+                if id and rest and id ~= net.selfId then   -- our own copy: we have no ghost of ourselves
                     local other = knownPeer("@" .. id)
                     other.id = id
                     other.files = nil           -- the host's file, not theirs
-                    other.playerLine = "P " .. rest
+                    -- The host forwards the guest's own line verbatim: "Q <id> P <seq> <x> ...".
+                    other.playerLine = rest
                     applyPlayerLine(other, other.playerLine)
                 end
             elseif kind == "E" then
@@ -1706,8 +1709,10 @@ return function(api)
         for name in (readText(modDir() .. "net_status.txt") or ""):gmatch("peer%d+=([%w%.%-]+),") do
             writeText(modDir() .. "net_in_" .. name .. ".txt", "")
         end
-        -- Our own id in the snapshot, so a guest reading the host's forwarded "Q" lines knows which one is us.
-        net.selfId = tostring(os.time() % 100000) .. tostring(math.random(100, 999))
+        -- Our own id in the snapshot, so a guest reading the host's forwarded "Q" lines knows which one is us. Two
+        -- players who pick the same one would each skip the other's forwarded line and see one partner instead of
+        -- two, so it carries more than the handful of values a clock's second gives.
+        net.selfId = tostring(os.time() % 10000) .. tostring(math.random(100000, 999999))
         -- A new event session: the relay forwards it and the peer starts a fresh inbox.
         net.session = tostring(os.time()) .. tostring(math.random(1000, 9999))
         net.nextEventId = 1

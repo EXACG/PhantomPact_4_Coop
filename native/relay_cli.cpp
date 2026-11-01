@@ -21,6 +21,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (key == L"--seconds") o.seconds = _wtof(value.c_str());
         else if (key == L"--alive-file") o.alive_file = value;
         else if (key == L"--alive-timeout") o.alive_timeout = _wtof(value.c_str());
+        else if (key == L"--max-players") o.max_players = _wtoi(value.c_str());
         else {
             std::fprintf(stderr, "unknown argument %s\n", relay::narrow(key).c_str());
             return 2;

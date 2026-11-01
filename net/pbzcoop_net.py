@@ -264,8 +264,8 @@ class Peer:
 class Stage:
     """Who this relay talks to: stage 1 of docs/MULTIPLAYER.md, the relay learns about peers.
 
-    A host accepts every sender that passes the filter, up to max_players: the first one to talk fills the second
-    slot, so a host with one guest behaves exactly like 1.4.1. A guest keeps one peer per network (its host) and
+    A host accepts every sender that passes the filter, up to max_players (which counts the host itself, so the
+    default 2 is one guest: exactly what 1.4.1 was). A guest keeps one peer per network (its host) and
     never answers another guest's ping. Peers are told apart by address, or by the link's own identity (a Steam
     name) where it has one, which survives an address change. Only the mod-side file names depend on how many
     peers there are, and that's Relay's business.
@@ -707,7 +707,12 @@ class Relay:
             if peer is not None:
                 print(f"found the host: {self._who(peer)}", flush=True)
             return peer
-        if len(self.stage.peers) >= self.stage.max_players:
+        # MaxPlayers counts the host too: a host with 2 takes one guest, not two. (Counted off by one, the default
+        # let a third player in, while the ini and every doc promise a pair.)
+        # Only live peers take a slot: a guest whose relay crashed and restarted must get back in at once instead
+        # of waiting out PRUNE_AFTER (12 s) with no partner.
+        occupied = sum(1 for p in self.stage.peers.values() if p.alive(now))
+        if occupied >= self.stage.max_players - 1:
             return None
         peer = self._join(addr, now)
         self._fresh = peer is not None
